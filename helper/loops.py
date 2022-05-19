@@ -2,68 +2,64 @@ from __future__ import print_function, division
 
 import sys
 import time
+import logging
 import torch
 import torch.nn.functional as F
-from .util import AverageMeter, accuracy
+from .util import AverageMeter, accuracy, progress_bar
 
 
 def train_vanilla(epoch, train_loader, model, criterion, optimizer, opt):
     """vanilla training"""
+    print('\nEpoch: %d' % epoch)
     model.train()
 
-    batch_time = AverageMeter()
-    data_time = AverageMeter()
-    losses = AverageMeter()
-    top1 = AverageMeter()
-    top5 = AverageMeter()
+    # batch_time = AverageMeter()
+    # data_time = AverageMeter()
+    train_loss = 0
+    correct = 0
+    total = 0 
 
-    end = time.time()
-    for idx, (input, target) in enumerate(train_loader):
-        data_time.update(time.time() - end)
+
+    for batch_idx, (input, target) in enumerate(train_loader):
+        # data_time.update(time.time() - end)
 
         input = input.float()
         if torch.cuda.is_available():
             input = input.cuda()
             target = target.cuda()
-
+            
+        batch_size = input.size(0)
 
         # ===================forward=====================
         output = model(input)
         loss = criterion(output, target)
-
-        acc1, acc5 = accuracy(output, target, topk=(1, 5))
-        losses.update(loss.item(), input.size(0))
-        top1.update(acc1[0], input.size(0))
-        top5.update(acc5[0], input.size(0))
+        train_loss += loss.item()
+        
+        _, predicted = torch.max(output, 1)
+        total += target.size(0)
+        correct += predicted.eq(target.data).sum().float().cpu()
 
         # ===================backward=====================
         optimizer.zero_grad()
         loss.backward()
         optimizer.step()
+        
+        # print info
+        progress_bar(batch_idx, len(train_loader), 
+                     'Loss: %.3f | Acc: %.3f%% (%d/%d) '
+                     % (train_loss/(batch_idx+1), 100.*correct/total, correct, total))
 
-        # ===================meters=====================
-        batch_time.update(time.time() - end)
-        end = time.time()
 
         # tensorboard logger
         pass
 
-        # print info
-        if idx % opt.print_freq == 0:
-            print('Epoch: [{0}][{1}/{2}]\t'
-                  'Time {batch_time.val:.3f} ({batch_time.avg:.3f})\t'
-                  'Data {data_time.val:.3f} ({data_time.avg:.3f})\t'
-                  'Loss {loss.val:.4f} ({loss.avg:.4f})\t'
-                  'Acc@1 {top1.val:.3f} ({top1.avg:.3f})\t'
-                  'Acc@5 {top5.val:.3f} ({top5.avg:.3f})'.format(
-                   epoch, idx, len(train_loader), batch_time=batch_time,
-                   data_time=data_time, loss=losses, top1=top1, top5=top5))
-            sys.stdout.flush()
+    logger = logging.getLogger('train')
+    logger.info('[Epoch {}] [Loss {:.3f}] [Acc {:.3f}]'.format(
+        epoch,
+        train_loss/(batch_idx+1),
+        100.*correct/total))
 
-    print(' * Acc@1 {top1.avg:.3f} Acc@5 {top5.avg:.3f}'
-          .format(top1=top1, top5=top5))
-
-    return top1.avg, losses.avg
+    return 100.*correct/total, train_loss/batch_idx
 
 
 def train_distill(epoch, train_loader, module_list, criterion_list, optimizer, opt):
@@ -88,21 +84,18 @@ def train_distill(epoch, train_loader, module_list, criterion_list, optimizer, o
     model_s = module_list[0]
     model_t = module_list[-1]
 
-    batch_time = AverageMeter()
-    data_time = AverageMeter()
-    losses = AverageMeter()
-    top1 = AverageMeter()
-    top5 = AverageMeter()
+    train_loss = 0
+    correct = 0
+    total = 0 
 
     end = time.time()
-    for idx, data in enumerate(train_loader):
+    for batch_idx, data in enumerate(train_loader):
         if opt.distill in ['crd']:
             input, target, index, contrast_idx = data
         elif opt.distill in ['mlkd']:
             input, target = data
         else:
             input, target, index = data
-        data_time.update(time.time() - end)
 
         input = input.float()
         if torch.cuda.is_available():
@@ -139,9 +132,12 @@ def train_distill(epoch, train_loader, module_list, criterion_list, optimizer, o
         loss_align = 0
 
         # other kd beyond KL divergence
-        if opt.distill == 'kd':
+        if opt.distill == 'kd' or opt.distill == 'ckd':
             loss_kd = 0
             loss_corr = criterion_corr(logit_s, logit_t)
+        elif opt.distill == 'skd':
+            loss_kd = 0
+            loss_corr = criterion_corr(logit_s, logit_t, target) 
         elif opt.distill == 'mlkd':
             f_s = feat_s[-1]
             f_t = feat_t[-1]
@@ -219,59 +215,49 @@ def train_distill(epoch, train_loader, module_list, criterion_list, optimizer, o
             raise NotImplementedError(opt.distill)
 
         loss = opt.gamma * loss_cls + opt.alpha * loss_corr + opt.beta * loss_kd + opt.delta * loss_align
+        train_loss += loss.item()
         
         if opt.distill == 'mlkd':
-            acc1, acc5 = accuracy(logit_s[nor_index], target, topk=(1, 5))
+            _, predicted = torch.max(logit_s[nor_index], 1)
         else:
-            acc1, acc5 = accuracy(logit_s, target, topk=(1, 5))
-        
-        losses.update(loss.item(), input.size(0))
-        top1.update(acc1[0], input.size(0))
-        top5.update(acc5[0], input.size(0))
+            _, predicted = torch.max(logit_s, 1)
+            
+        total += target.size(0)
+        correct += predicted.eq(target.data).cpu().sum().float()
 
         # ===================backward=====================
         optimizer.zero_grad()
         loss.backward()
         optimizer.step()
 
-        # ===================meters=====================
-        batch_time.update(time.time() - end)
-        end = time.time()
-
         # print info
-        if idx % opt.print_freq == 0:
-            print('Epoch: [{0}][{1}/{2}]\t'
-                  'Time {batch_time.val:.3f} ({batch_time.avg:.3f})\t'
-                  'Data {data_time.val:.3f} ({data_time.avg:.3f})\t'
-                  'Loss {loss.val:.4f} ({loss.avg:.4f})\t'
-                  'Acc@1 {top1.val:.3f} ({top1.avg:.3f})\t'
-                  'Acc@5 {top5.val:.3f} ({top5.avg:.3f})'.format(
-                epoch, idx, len(train_loader), batch_time=batch_time,
-                data_time=data_time, loss=losses, top1=top1, top5=top5))
-            sys.stdout.flush()
+        progress_bar(batch_idx, len(train_loader), 
+                     'Loss: %.3f | Acc: %.3f%% (%d/%d) '
+                     % (train_loss/(batch_idx+1), 100.*correct/total, correct, total))
 
-    print(' * Acc@1 {top1.avg:.3f} Acc@5 {top5.avg:.3f}'
-          .format(top1=top1, top5=top5))
-
-    return top1.avg, losses.avg
+    logger = logging.getLogger('train')
+    logger.info('[Epoch {}] [Loss {:.3f}] [Acc {:.3f}]'.format(
+        epoch,
+        train_loss/(batch_idx+1),
+        100.*correct/total))
+    
+    return 100.*correct/total, train_loss/batch_idx
 
 
-def validate(val_loader, model, criterion, opt):
+def validate(epoch, val_loader, model, criterion, opt):
     """validation"""
-    batch_time = AverageMeter()
-    losses = AverageMeter()
-    top1 = AverageMeter()
-    top5 = AverageMeter()
+    val_loss = 0.0
+    correct = 0.0
+    total = 0.0
 
     # switch to evaluate mode
     model.eval()
 
     with torch.no_grad():
-        end = time.time()
-        for idx, (input, target) in enumerate(val_loader):
+        for batch_idx, (input, target) in enumerate(val_loader):
 
-            if opt.distill == 'mlkd':
-                input = input[:,0,:,:,:]
+            #if opt.distill == 'mlkd':
+             #   input = input[:,0,:,:,:]
 
             input = input.float()
             if torch.cuda.is_available():
@@ -283,25 +269,20 @@ def validate(val_loader, model, criterion, opt):
             loss = criterion(output, target)
 
             # measure accuracy and record loss
-            acc1, acc5 = accuracy(output, target, topk=(1, 5))
-            losses.update(loss.item(), input.size(0))
-            top1.update(acc1[0], input.size(0))
-            top5.update(acc5[0], input.size(0))
+            val_loss += loss.item()
+            _, predicted = torch.max(output, 1)
+            total += target.size(0)
+            correct += predicted.eq(target.data).cpu().sum().float()
 
-            # measure elapsed time
-            batch_time.update(time.time() - end)
-            end = time.time()
+            progress_bar(batch_idx, len(val_loader),
+                         'Loss: %.3f | Acc: %.3f%% (%d/%d) '
+                         % (val_loss/(batch_idx+1), 100.*correct/total, correct, total))
 
-            if idx % opt.print_freq == 0:
-                print('Test: [{0}/{1}]\t'
-                      'Time {batch_time.val:.3f} ({batch_time.avg:.3f})\t'
-                      'Loss {loss.val:.4f} ({loss.avg:.4f})\t'
-                      'Acc@1 {top1.val:.3f} ({top1.avg:.3f})\t'
-                      'Acc@5 {top5.val:.3f} ({top5.avg:.3f})'.format(
-                       idx, len(val_loader), batch_time=batch_time, loss=losses,
-                       top1=top1, top5=top5))
+    acc = 100.*correct/total
+    logger = logging.getLogger('val')
+    logger.info('[Epoch {}] [Loss {:.3f}] [Acc {:.3f}]'.format(
+        epoch,
+        val_loss/(batch_idx+1),
+        acc))
 
-        print(' * Acc@1 {top1.avg:.3f} Acc@5 {top5.avg:.3f}'
-              .format(top1=top1, top5=top5))
-
-    return top1.avg, top5.avg, losses.avg
+    return acc, val_loss/(batch_idx+1)

@@ -1,5 +1,7 @@
 # fetch pre-trained teacher models
 
+cd ..
+
 mkdir -p save/models/
 
 cd save/models

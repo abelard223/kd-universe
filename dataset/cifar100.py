@@ -30,7 +30,7 @@ def get_data_folder():
     elif hostname.startswith('yonglong-home'):
         data_folder = '/home/yonglong/Data/data'
     else:
-        data_folder = './data/'
+        data_folder = '../data/'
 
     if not os.path.isdir(data_folder):
         os.makedirs(data_folder)
@@ -113,9 +113,9 @@ class CIFAR100Instance(datasets.CIFAR100):
     """
     def __getitem__(self, index):
         if self.train:
-            img, target = self.train_data[index], self.train_labels[index]
+            img, target = self.data[index], self.targets[index]
         else:
-            img, target = self.test_data[index], self.test_labels[index]
+            img, target = self.data[index], self.targets[index]
 
         # doing this so that it is consistent with all other datasets
         # to return a PIL Image
